@@ -9,6 +9,8 @@ from kubernetes.client.rest import ApiException
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from redis.asyncio import Redis
 
+from workload_catalog import Workload, load_catalog, resolve_workload, validate_digest
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -21,32 +23,70 @@ GROUP = "sandbox-consumers"
 CONSUMER = os.getenv("HOSTNAME", "consumer")
 NAMESPACE = os.getenv("SANDBOX_NAMESPACE", "sandboxes")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost").rstrip("/")
-JOB_ID = re.compile(r"^[a-zA-Z0-9-]{1,40}$")
+JOB_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
-processed = Counter("jobs_processed_total", "Jobs processed", ["result"])
-startup = Histogram("sandbox_startup_duration_seconds", "Time until sandbox pod is ready")
-active = Gauge("sandbox_active", "Sandboxes created by this consumer")
+processed = Counter(
+    "jobs_processed_total", "Jobs processed", ["result", "workload", "workload_version"]
+)
+startup = Histogram(
+    "sandbox_startup_duration_seconds",
+    "Time until sandbox pod is ready",
+    ["workload", "workload_version"],
+)
+active = Gauge(
+    "sandbox_active", "Sandboxes created by this consumer", ["workload", "workload_version"]
+)
 
 
-def ensure_sandbox(core: client.CoreV1Api, networking: client.NetworkingV1Api, job_id: str) -> None:
+def ensure_sandbox(
+    core: client.CoreV1Api,
+    networking: client.NetworkingV1Api,
+    job_id: str,
+    workload: Workload,
+) -> bool:
     name = f"sandbox-{job_id.lower()}"
-    labels = {"app": "sandbox", "job-id": job_id}
+    labels = {
+        "app": "sandbox",
+        "job-id": job_id,
+        "workload": workload.name,
+        "workload-version": workload.version,
+    }
+    annotations = {"orchestration.duvo.ai/manifest-digest": workload.digest}
+    container = workload.spec["container"]
+    resources = workload.spec["resources"]
     pod = client.V1Pod(
-        metadata=client.V1ObjectMeta(name=name, namespace=NAMESPACE, labels=labels),
+        metadata=client.V1ObjectMeta(
+            name=name, namespace=NAMESPACE, labels=labels, annotations=annotations
+        ),
         spec=client.V1PodSpec(
             restart_policy="Never",
             automount_service_account_token=False,
+            enable_service_links=False,
+            security_context=client.V1PodSecurityContext(
+                run_as_non_root=True,
+                run_as_user=65532,
+                run_as_group=65532,
+                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+            ),
             containers=[client.V1Container(
                 name="http",
-                image="hashicorp/http-echo:1.0",
-                args=["-listen=:5678", f"-text=sandbox {job_id} is ready"],
-                ports=[client.V1ContainerPort(container_port=5678)],
+                image=container["image"],
+                image_pull_policy=container.get("imagePullPolicy", "IfNotPresent"),
+                args=container.get("args", []),
+                ports=[client.V1ContainerPort(container_port=container["port"])],
                 resources=client.V1ResourceRequirements(
-                    requests={"cpu": "10m", "memory": "16Mi"},
-                    limits={"cpu": "100m", "memory": "64Mi"},
+                    requests=resources["requests"],
+                    limits=resources["limits"],
+                ),
+                security_context=client.V1SecurityContext(
+                    allow_privilege_escalation=False,
+                    capabilities=client.V1Capabilities(drop=["ALL"]),
+                    read_only_root_filesystem=True,
                 ),
                 readiness_probe=client.V1Probe(
-                    http_get=client.V1HTTPGetAction(path="/", port=5678),
+                    http_get=client.V1HTTPGetAction(
+                        path=workload.spec["readiness"]["path"], port=container["port"]
+                    ),
                     initial_delay_seconds=1,
                     period_seconds=2,
                 ),
@@ -57,7 +97,7 @@ def ensure_sandbox(core: client.CoreV1Api, networking: client.NetworkingV1Api, j
         metadata=client.V1ObjectMeta(name=name, namespace=NAMESPACE, labels=labels),
         spec=client.V1ServiceSpec(
             selector=labels,
-            ports=[client.V1ServicePort(port=80, target_port=5678)],
+            ports=[client.V1ServicePort(port=80, target_port=container["port"])],
         ),
     )
     ingress = client.V1Ingress(
@@ -74,6 +114,21 @@ def ensure_sandbox(core: client.CoreV1Api, networking: client.NetworkingV1Api, j
         )]),
     )
 
+    try:
+        existing = core.read_namespaced_pod(name, NAMESPACE)
+    except ApiException as exc:
+        if exc.status != 404:
+            raise
+    else:
+        existing_digest = (existing.metadata.annotations or {}).get(
+            "orchestration.duvo.ai/manifest-digest"
+        )
+        if existing_digest != workload.digest:
+            raise ValueError(
+                f"jobId {job_id} already exists with a different workload manifest"
+            )
+
+    created = False
     for create, body in (
         (core.create_namespaced_pod, pod),
         (core.create_namespaced_service, service),
@@ -81,15 +136,26 @@ def ensure_sandbox(core: client.CoreV1Api, networking: client.NetworkingV1Api, j
     ):
         try:
             create(NAMESPACE, body)
+            if isinstance(body, client.V1Pod):
+                created = True
         except ApiException as exc:
             if exc.status != 409:
                 raise
+
+    current = core.read_namespaced_pod(name, NAMESPACE)
+    current_digest = (current.metadata.annotations or {}).get(
+        "orchestration.duvo.ai/manifest-digest"
+    )
+    if current_digest != workload.digest:
+        raise ValueError(
+            f"jobId {job_id} already exists with a different workload manifest"
+        )
 
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         current = core.read_namespaced_pod(name, NAMESPACE)
         if any(c.type == "Ready" and c.status == "True" for c in (current.status.conditions or [])):
-            return
+            return created
         time.sleep(2)
     raise TimeoutError(f"sandbox {name} did not become ready")
 
@@ -100,6 +166,7 @@ async def main() -> None:
     core = client.CoreV1Api()
     networking = client.NetworkingV1Api()
     redis = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
+    catalog = load_catalog()
     try:
         await redis.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
     except Exception as exc:
@@ -116,14 +183,46 @@ async def main() -> None:
                 try:
                     if not JOB_ID.fullmatch(job_id):
                         raise ValueError("invalid jobId")
-                    await asyncio.to_thread(ensure_sandbox, core, networking, job_id)
+                    if fields.get("schemaVersion") != "1":
+                        raise ValueError("unsupported job schemaVersion")
+                    manifest_digest = fields.get("manifestDigest", "")
+                    if not validate_digest(manifest_digest):
+                        raise ValueError("invalid manifestDigest")
+                    workload = resolve_workload(
+                        catalog,
+                        fields.get("workloadName", ""),
+                        fields.get("workloadVersion", ""),
+                    )
+                    if workload.digest != manifest_digest:
+                        raise ValueError(
+                            "manifest digest mismatch; producer and consumer catalogs differ"
+                        )
+                    created = await asyncio.to_thread(
+                        ensure_sandbox, core, networking, job_id, workload
+                    )
                     await redis.xack(STREAM, GROUP, message_id)
-                    startup.observe(time.monotonic() - started)
-                    active.inc()
-                    processed.labels(result="success").inc()
-                    log.info("sandbox_ready job_id=%s url=%s/sandboxes/%s", job_id, PUBLIC_BASE_URL, job_id)
+                    startup.labels(
+                        workload=workload.name, workload_version=workload.version
+                    ).observe(time.monotonic() - started)
+                    if created:
+                        active.labels(
+                            workload=workload.name, workload_version=workload.version
+                        ).inc()
+                    processed.labels(
+                        result="success",
+                        workload=workload.name,
+                        workload_version=workload.version,
+                    ).inc()
+                    log.info(
+                        "sandbox_ready job_id=%s workload=%s version=%s url=%s/sandboxes/%s",
+                        job_id, workload.name, workload.version, PUBLIC_BASE_URL, job_id,
+                    )
                 except Exception:
-                    processed.labels(result="error").inc()
+                    processed.labels(
+                        result="error",
+                        workload=fields.get("workloadName", "unknown"),
+                        workload_version=fields.get("workloadVersion", "unknown"),
+                    ).inc()
                     log.exception("job_failed job_id=%s message_id=%s", job_id, message_id)
 
 

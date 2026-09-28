@@ -1,0 +1,558 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+---
+# These services deliberately live beside the workloads and are only reachable
+# inside the cluster. They avoid coupling scrape configuration to platform.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: producer-metrics
+  namespace: platform
+spec:
+  selector:
+    app: producer
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer-metrics
+  namespace: platform
+spec:
+  selector:
+    app: consumer
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vm-scrape-config
+  namespace: observability
+data:
+  scrape.yml: |
+    global:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+    scrape_configs:
+      - job_name: producer
+        static_configs:
+          - targets: [producer-metrics.platform.svc.cluster.local:8000]
+      - job_name: consumer
+        static_configs:
+          - targets: [consumer-metrics.platform.svc.cluster.local:8000]
+      - job_name: redis
+        static_configs:
+          - targets: [redis-exporter.observability.svc.cluster.local:9121]
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: [kube-state-metrics.observability.svc.cluster.local:8080]
+      - job_name: node
+        static_configs:
+          - targets: [node-exporter.observability.svc.cluster.local:9100]
+      - job_name: victoriametrics
+        static_configs:
+          - targets: [victoriametrics.observability.svc.cluster.local:8428]
+      - job_name: vmalert
+        static_configs:
+          - targets: [vmalert.observability.svc.cluster.local:8880]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-rules
+  namespace: observability
+data:
+  alerts.yml: |
+    groups:
+      - name: duvo-service-health
+        rules:
+          - alert: ProducerUnavailable
+            expr: up{job="producer"} == 0
+            for: 2m
+            labels: {severity: critical}
+            annotations:
+              summary: Producer metrics endpoint is unavailable
+          - alert: ConsumerUnavailable
+            expr: up{job="consumer"} == 0
+            for: 2m
+            labels: {severity: critical}
+            annotations:
+              summary: Consumer metrics endpoint is unavailable
+          - alert: QueueBacklog
+            expr: sum(redis_stream_group_lag{group="sandbox-consumers"}) + sum(redis_stream_group_messages_pending{group="sandbox-consumers"}) > 20
+            for: 5m
+            labels: {severity: warning}
+            annotations:
+              summary: Redis stream backlog exceeds 20 jobs
+          - alert: ConsumerErrors
+            expr: sum(rate(jobs_processed_total{result="error"}[5m])) / clamp_min(sum(rate(jobs_processed_total[5m])), 0.001) > 0.05
+            for: 5m
+            labels: {severity: warning}
+            annotations:
+              summary: More than 5% of recently processed jobs are failing
+          - alert: SlowSandboxStartup
+            expr: histogram_quantile(0.95, sum by (le) (rate(sandbox_startup_duration_seconds_bucket[10m]))) > 30
+            for: 10m
+            labels: {severity: warning}
+            annotations:
+              summary: Sandbox startup p95 exceeds 30 seconds
+          - alert: SandboxPodFailed
+            expr: sum(kube_pod_status_phase{namespace="sandboxes",phase="Failed"}) > 0
+            for: 2m
+            labels: {severity: warning}
+            annotations:
+              summary: One or more sandbox pods have failed
+      - name: duvo-cluster-health
+        rules:
+          - alert: KubernetesNodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 3m
+            labels: {severity: critical}
+            annotations:
+              summary: Kubernetes node is not Ready
+          - alert: NodeMemoryPressure
+            expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+            for: 10m
+            labels: {severity: warning}
+            annotations:
+              summary: Node has less than 10% available memory
+          - alert: NodeDiskPressure
+            expr: node_filesystem_avail_bytes{mountpoint="/",fstype!="rootfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="rootfs"} < 0.10
+            for: 10m
+            labels: {severity: warning}
+            annotations:
+              summary: Root filesystem has less than 10% free space
+          - alert: MetricsCollectionDegraded
+            expr: count(up == 0) > 0
+            for: 5m
+            labels: {severity: warning}
+            annotations:
+              summary: At least one metrics scrape target is down
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: victoria-data
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victoriametrics
+  namespace: observability
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: victoriametrics}
+  template:
+    metadata:
+      labels: {app: victoriametrics}
+    spec:
+      containers:
+        - name: victoriametrics
+          image: victoriametrics/victoria-metrics:v1.105.0
+          args:
+            - -storageDataPath=/storage
+            - -retentionPeriod=14d
+            - -promscrape.config=/etc/vm/scrape.yml
+            - -httpListenAddr=:8428
+          ports:
+            - {name: http, containerPort: 8428}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /storage}
+            - {name: scrape, mountPath: /etc/vm, readOnly: true}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: victoria-data}
+        - name: scrape
+          configMap: {name: vm-scrape-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoriametrics
+  namespace: observability
+spec:
+  selector: {app: victoriametrics}
+  ports:
+    - {name: http, port: 8428, targetPort: 8428}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: redis-exporter}
+  template:
+    metadata:
+      labels: {app: redis-exporter}
+    spec:
+      containers:
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.62.0
+          env:
+            - {name: REDIS_ADDR, value: redis://redis.platform.svc.cluster.local:6379}
+            - {name: REDIS_EXPORTER_CHECK_STREAMS, value: sandbox:jobs}
+          ports:
+            - {name: metrics, containerPort: 9121}
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 100m, memory: 96Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  namespace: observability
+spec:
+  selector: {app: redis-exporter}
+  ports:
+    - {name: metrics, port: 9121, targetPort: 9121}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: duvo-kube-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, namespaces]
+    verbs: [list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: duvo-kube-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: duvo-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kube-state-metrics}
+  template:
+    metadata:
+      labels: {app: kube-state-metrics}
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0
+          args:
+            - "--namespaces=platform,sandboxes,observability"
+            - "--resources=nodes,pods,namespaces,deployments,replicasets"
+          ports:
+            - {name: http, containerPort: 8080}
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {cpu: 200m, memory: 192Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+spec:
+  selector: {app: kube-state-metrics}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: observability
+spec:
+  selector:
+    matchLabels: {app: node-exporter}
+  template:
+    metadata:
+      labels: {app: node-exporter}
+    spec:
+      hostPID: true
+      hostNetwork: true
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.8.2
+          args:
+            - --path.rootfs=/host
+            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+          ports:
+            - {name: metrics, containerPort: 9100}
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 100m, memory: 96Mi}
+          volumeMounts:
+            - {name: root, mountPath: /host, readOnly: true}
+      volumes:
+        - name: root
+          hostPath: {path: /}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: observability
+spec:
+  selector: {app: node-exporter}
+  ports:
+    - {name: metrics, port: 9100, targetPort: 9100}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: observability
+data:
+  alertmanager.yml: |
+    route:
+      receiver: local-log
+      group_by: [alertname]
+      group_wait: 15s
+      group_interval: 5m
+      repeat_interval: 4h
+    receivers:
+      - name: local-log
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: alertmanager}
+  template:
+    metadata:
+      labels: {app: alertmanager}
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args: [--config.file=/etc/alertmanager/alertmanager.yml]
+          ports:
+            - {name: http, containerPort: 9093}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 128Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: alertmanager-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: observability
+spec:
+  selector: {app: alertmanager}
+  ports:
+    - {name: http, port: 9093, targetPort: 9093}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmalert
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: vmalert}
+  template:
+    metadata:
+      labels: {app: vmalert}
+    spec:
+      containers:
+        - name: vmalert
+          image: victoriametrics/vmalert:v1.105.0
+          args:
+            - -rule=/etc/vmalert/alerts.yml
+            - -datasource.url=http://victoriametrics:8428
+            - -remoteWrite.url=http://victoriametrics:8428
+            - -notifier.url=http://alertmanager:9093
+          ports:
+            - {name: http, containerPort: 8880}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {cpu: 200m, memory: 192Mi}
+          volumeMounts:
+            - {name: rules, mountPath: /etc/vmalert, readOnly: true}
+      volumes:
+        - name: rules
+          configMap: {name: alert-rules}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmalert
+  namespace: observability
+spec:
+  selector: {app: vmalert}
+  ports:
+    - {name: http, port: 8880, targetPort: 8880}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: observability
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        uid: victoria
+        url: http://victoriametrics:8428
+        access: proxy
+        isDefault: true
+        editable: false
+  dashboard.yml: |
+    apiVersion: 1
+    providers:
+      - name: duvo
+        orgId: 1
+        folder: Duvo
+        type: file
+        disableDeletion: true
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: grafana}
+  template:
+    metadata:
+      labels: {app: grafana}
+    spec:
+      securityContext:
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.2.0
+          env:
+            - {name: GF_SERVER_ROOT_URL, value: "%(protocol)s://%(domain)s/grafana/"}
+            - {name: GF_SERVER_SERVE_FROM_SUB_PATH, value: "true"}
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}
+            - {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Viewer}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: grafana-admin, key: password}
+          ports:
+            - {name: http, containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /api/health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/grafana}
+            - {name: provisioning, mountPath: /etc/grafana/provisioning/datasources/datasource.yml, subPath: datasource.yml, readOnly: true}
+            - {name: provisioning, mountPath: /etc/grafana/provisioning/dashboards/dashboard.yml, subPath: dashboard.yml, readOnly: true}
+            - {name: dashboard, mountPath: /var/lib/grafana/dashboards, readOnly: true}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: grafana-data}
+        - name: provisioning
+          configMap: {name: grafana-provisioning}
+        - name: dashboard
+          configMap: {name: grafana-dashboard}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  selector: {app: grafana}
+  ports:
+    - {name: http, port: 80, targetPort: 3000}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port: {number: 80}

@@ -115,6 +115,7 @@ spec:
             - pip install --no-cache-dir -r /app/requirements.txt && exec uvicorn producer:app --host 0.0.0.0 --port 8000 --app-dir /app
           env:
             - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: WORKLOAD_CATALOG_PATH, value: "/manifests/workloads.json"}
           ports:
             - {name: http, containerPort: 8000}
           readinessProbe:
@@ -126,9 +127,12 @@ spec:
             limits: {cpu: 500m, memory: 256Mi}
           volumeMounts:
             - {name: code, mountPath: /app}
+            - {name: workloads, mountPath: /manifests, readOnly: true}
       volumes:
         - name: code
           configMap: {name: platform-code}
+        - name: workloads
+          configMap: {name: workload-manifests}
 ---
 apiVersion: v1
 kind: Service
@@ -150,6 +154,12 @@ spec:
     - http:
         paths:
           - path: /api/jobs
+            pathType: Exact
+            backend:
+              service:
+                name: producer
+                port: {number: 80}
+          - path: /api/workloads
             pathType: Exact
             backend:
               service:
@@ -180,6 +190,7 @@ spec:
             - {name: REDIS_URL, value: "redis://redis:6379/0"}
             - {name: SANDBOX_NAMESPACE, value: sandboxes}
             - {name: PUBLIC_BASE_URL, value: "__PUBLIC_BASE_URL__"}
+            - {name: WORKLOAD_CATALOG_PATH, value: "/manifests/workloads.json"}
           ports:
             - {name: metrics, containerPort: 8000}
           resources:
@@ -187,6 +198,9 @@ spec:
             limits: {cpu: 500m, memory: 384Mi}
           volumeMounts:
             - {name: code, mountPath: /app}
+            - {name: workloads, mountPath: /manifests, readOnly: true}
       volumes:
         - name: code
           configMap: {name: platform-code}
+        - name: workloads
+          configMap: {name: workload-manifests}

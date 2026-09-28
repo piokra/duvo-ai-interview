@@ -1,0 +1,46 @@
+[
+  {
+    "apiVersion": "orchestration.duvo.ai/v1alpha1",
+    "kind": "SandboxWorkload",
+    "metadata": {
+      "name": "http-echo",
+      "version": "1.0.0",
+      "description": "Minimal HTTP sandbox used for availability checks"
+    },
+    "spec": {
+      "container": {
+        "image": "hashicorp/http-echo:1.0",
+        "imagePullPolicy": "IfNotPresent",
+        "port": 5678,
+        "args": ["-listen=:5678", "-text=duvo sandbox is ready"]
+      },
+      "resources": {
+        "requests": {"cpu": "10m", "memory": "16Mi"},
+        "limits": {"cpu": "100m", "memory": "64Mi"}
+      },
+      "readiness": {"path": "/"}
+    }
+  },
+  {
+    "apiVersion": "orchestration.duvo.ai/v1alpha1",
+    "kind": "SandboxWorkload",
+    "metadata": {
+      "name": "request-inspector",
+      "version": "1.0.0",
+      "description": "Returns request and runtime metadata for agent connectivity diagnostics"
+    },
+    "spec": {
+      "container": {
+        "image": "traefik/whoami:v1.10.3",
+        "imagePullPolicy": "IfNotPresent",
+        "port": 8080,
+        "args": ["--port=8080"]
+      },
+      "resources": {
+        "requests": {"cpu": "10m", "memory": "16Mi"},
+        "limits": {"cpu": "100m", "memory": "64Mi"}
+      },
+      "readiness": {"path": "/"}
+    }
+  }
+]

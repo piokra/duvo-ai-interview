@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://duvo.ai/schemas/sandbox-workload-v1alpha1.json",
+  "title": "SandboxWorkload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": {"const": "orchestration.duvo.ai/v1alpha1"},
+    "kind": {"const": "SandboxWorkload"},
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "description"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,39}$"},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "description": {"type": "string"}
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["container", "resources", "readiness"],
+      "properties": {
+        "container": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["image", "imagePullPolicy", "port", "args"],
+          "properties": {
+            "image": {
+              "type": "string",
+              "pattern": "^(?!.*:latest$).+(?::[^/:]+|@sha256:[0-9a-f]{64})$"
+            },
+            "imagePullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "args": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requests", "limits"],
+          "properties": {
+            "requests": {"$ref": "#/$defs/resources"},
+            "limits": {"$ref": "#/$defs/resources"}
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {"path": {"type": "string", "pattern": "^/"}}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory"],
+      "properties": {
+        "cpu": {"type": "string", "minLength": 1},
+        "memory": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
