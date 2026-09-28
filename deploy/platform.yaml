@@ -1,0 +1,192 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandboxes
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: consumer
+  namespace: platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-manager
+  namespace: sandboxes
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: consumer-sandbox-manager
+  namespace: sandboxes
+subjects:
+  - kind: ServiceAccount
+    name: consumer
+    namespace: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-manager
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: platform
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: redis}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["redis-server", "--appendonly", "yes"]
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            exec: {command: ["redis-cli", "ping"]}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: redis-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: platform
+spec:
+  selector: {app: redis}
+  ports:
+    - {name: redis, port: 6379, targetPort: 6379}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: producer}
+  template:
+    metadata:
+      labels: {app: producer}
+    spec:
+      containers:
+        - name: producer
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir -r /app/requirements.txt && exec uvicorn producer:app --host 0.0.0.0 --port 8000 --app-dir /app
+          env:
+            - {name: REDIS_URL, value: "redis://redis:6379/0"}
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - {name: code, mountPath: /app}
+      volumes:
+        - name: code
+          configMap: {name: platform-code}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: producer
+  namespace: platform
+spec:
+  selector: {app: producer}
+  ports:
+    - {name: http, port: 80, targetPort: 8000}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: producer
+  namespace: platform
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/jobs
+            pathType: Exact
+            backend:
+              service:
+                name: producer
+                port: {number: 80}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: consumer}
+  template:
+    metadata:
+      labels: {app: consumer}
+    spec:
+      serviceAccountName: consumer
+      containers:
+        - name: consumer
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir -r /app/requirements.txt && exec python /app/consumer.py
+          env:
+            - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: SANDBOX_NAMESPACE, value: sandboxes}
+            - {name: PUBLIC_BASE_URL, value: "__PUBLIC_BASE_URL__"}
+          ports:
+            - {name: metrics, containerPort: 8000}
+          resources:
+            requests: {cpu: 25m, memory: 96Mi}
+            limits: {cpu: 500m, memory: 384Mi}
+          volumeMounts:
+            - {name: code, mountPath: /app}
+      volumes:
+        - name: code
+          configMap: {name: platform-code}

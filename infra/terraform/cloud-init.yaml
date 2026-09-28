@@ -1,0 +1,26 @@
+#cloud-config
+package_update: true
+packages:
+  - curl
+  - jq
+  - fail2ban
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/90-sre-sandbox.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin prohibit-password
+  - path: /etc/sysctl.d/90-kubernetes.conf
+    permissions: "0644"
+    content: |
+      net.ipv4.ip_forward=1
+      fs.inotify.max_user_instances=8192
+      fs.inotify.max_user_watches=524288
+
+runcmd:
+  - [systemctl, restart, ssh]
+  - [sysctl, --system]
+  - [sh, -c, "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --write-kubeconfig-mode=600 --disable=metrics-server' sh -"]
+  - [sh, -c, "until kubectl get nodes >/dev/null 2>&1; do sleep 2; done"]
+  - [kubectl, wait, --for=condition=Ready, node, --all, --timeout=180s]
