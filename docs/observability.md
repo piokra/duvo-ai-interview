@@ -7,7 +7,13 @@ The interview deployment uses a compact, single-node monitoring stack:
 - `vmalert` evaluates version-controlled rules and sends firing alerts to a
   local Alertmanager.
 - Redis Exporter reports queue/stream state, kube-state-metrics reports
-  workload state, and node-exporter reports host capacity.
+workload state, and node-exporter reports host capacity.
+
+The dashboard includes produced counts, successful completion rate, batch
+processing p95, and live Kubernetes Job success counts grouped by workload and
+manifest version. It also plots canary traffic weight, observed error ratio,
+and rollout state so the automated rollback remains visible. The default
+`load-generator` emits an aggregate 10 jobs per second.
 
 Deploy or update it with:
 

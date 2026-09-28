@@ -32,6 +32,19 @@ spec:
       targetPort: 8000
 ---
 apiVersion: v1
+kind: Service
+metadata:
+  name: rollout-controller-metrics
+  namespace: platform
+spec:
+  selector:
+    app: rollout-controller
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: vm-scrape-config
@@ -48,6 +61,9 @@ data:
       - job_name: consumer
         static_configs:
           - targets: [consumer-metrics.platform.svc.cluster.local:8000]
+      - job_name: rollout-controller
+        static_configs:
+          - targets: [rollout-controller-metrics.platform.svc.cluster.local:8000]
       - job_name: redis
         static_configs:
           - targets: [redis-exporter.observability.svc.cluster.local:9121]
@@ -87,7 +103,7 @@ data:
             annotations:
               summary: Consumer metrics endpoint is unavailable
           - alert: QueueBacklog
-            expr: sum(redis_stream_group_lag{group="sandbox-consumers"}) + sum(redis_stream_group_messages_pending{group="sandbox-consumers"}) > 20
+            expr: sum(redis_stream_group_lag{group="rollout-consumers"}) + sum(redis_stream_group_messages_pending{group="rollout-consumers"}) > 20
             for: 5m
             labels: {severity: warning}
             annotations:
@@ -110,6 +126,18 @@ data:
             labels: {severity: warning}
             annotations:
               summary: One or more sandbox pods have failed
+          - alert: BatchJobFailed
+            expr: sum(kube_job_status_failed{namespace="sandboxes"}) > 0
+            for: 2m
+            labels: {severity: warning}
+            annotations:
+              summary: One or more synthetic Kubernetes Jobs have failed
+          - alert: CanaryRolledBack
+            expr: rollout_state{state="rolled_back"} == 1
+            for: 0m
+            labels: {severity: critical}
+            annotations:
+              summary: Automated workload rollout was rolled back
       - name: duvo-cluster-health
         rules:
           - alert: KubernetesNodeNotReady
@@ -217,7 +245,7 @@ spec:
           image: oliver006/redis_exporter:v1.62.0
           env:
             - {name: REDIS_ADDR, value: redis://redis.platform.svc.cluster.local:6379}
-            - {name: REDIS_EXPORTER_CHECK_STREAMS, value: sandbox:jobs}
+            - {name: REDIS_EXPORTER_CHECK_STREAMS, value: sandbox:jobs-rollout}
           ports:
             - {name: metrics, containerPort: 9121}
           resources:
@@ -250,6 +278,9 @@ rules:
     verbs: [list, watch]
   - apiGroups: [apps]
     resources: [deployments, replicasets]
+    verbs: [list, watch]
+  - apiGroups: [batch]
+    resources: [jobs]
     verbs: [list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -284,7 +315,8 @@ spec:
           image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0
           args:
             - "--namespaces=platform,sandboxes,observability"
-            - "--resources=nodes,pods,namespaces,deployments,replicasets"
+            - "--resources=nodes,pods,namespaces,deployments,replicasets,jobs"
+            - "--metric-labels-allowlist=jobs=[workload,workload-version]"
           ports:
             - {name: http, containerPort: 8080}
           resources:

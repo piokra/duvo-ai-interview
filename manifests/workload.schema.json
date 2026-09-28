@@ -21,12 +21,13 @@
     "spec": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["container", "resources", "readiness"],
+      "required": ["execution", "container", "resources"],
       "properties": {
+        "execution": {"enum": ["http", "batch"]},
         "container": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["image", "imagePullPolicy", "port", "args"],
+          "required": ["image", "imagePullPolicy", "args"],
           "properties": {
             "image": {
               "type": "string",
@@ -34,6 +35,7 @@
             },
             "imagePullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "command": {"type": "array", "items": {"type": "string"}},
             "args": {"type": "array", "items": {"type": "string"}}
           }
         },
@@ -51,8 +53,27 @@
           "additionalProperties": false,
           "required": ["path"],
           "properties": {"path": {"type": "string", "pattern": "^/"}}
+        },
+        "ttlSecondsAfterFinished": {"type": "integer", "minimum": 30, "maximum": 600}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "execution": {"const": "http"},
+            "container": {"required": ["port"]}
+          },
+          "required": ["readiness"],
+          "not": {"required": ["ttlSecondsAfterFinished"]}
+        },
+        {
+          "properties": {
+            "execution": {"const": "batch"},
+            "container": {"required": ["command"]}
+          },
+          "required": ["ttlSecondsAfterFinished"],
+          "not": {"anyOf": [{"required": ["readiness"]}, {"properties": {"container": {"required": ["port"]}}}]}
         }
-      }
+      ]
     }
   },
   "$defs": {

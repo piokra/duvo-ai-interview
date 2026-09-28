@@ -20,6 +20,8 @@ app = FastAPI(title="Sandbox job producer")
 app.mount("/metrics", make_asgi_app())
 redis = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
 catalog = load_catalog()
+stream_maxlen = int(os.getenv("STREAM_MAXLEN", "100000"))
+stream = os.getenv("JOB_STREAM", "sandbox:jobs")
 
 jobs_created = Counter(
     "jobs_produced_total", "Jobs accepted by the producer", ["workload", "workload_version"]
@@ -81,7 +83,9 @@ async def create_job(request: JobRequest):
         "attempt": "0",
     }
     with publish_seconds.time():
-        stream_id = await redis.xadd("sandbox:jobs", fields)
+        stream_id = await redis.xadd(
+            stream, fields, maxlen=stream_maxlen, approximate=True
+        )
     jobs_created.labels(workload=workload.name, workload_version=workload.version).inc()
     log.info(
         "job_enqueued job_id=%s workload=%s version=%s digest=%s stream_id=%s",

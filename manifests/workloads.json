@@ -8,6 +8,7 @@
       "description": "Minimal HTTP sandbox used for availability checks"
     },
     "spec": {
+      "execution": "http",
       "container": {
         "image": "hashicorp/http-echo:1.0",
         "imagePullPolicy": "IfNotPresent",
@@ -30,6 +31,7 @@
       "description": "Returns request and runtime metadata for agent connectivity diagnostics"
     },
     "spec": {
+      "execution": "http",
       "container": {
         "image": "traefik/whoami:v1.10.3",
         "imagePullPolicy": "IfNotPresent",
@@ -41,6 +43,75 @@
         "limits": {"cpu": "100m", "memory": "64Mi"}
       },
       "readiness": {"path": "/"}
+    }
+  },
+  {
+    "apiVersion": "orchestration.duvo.ai/v1alpha1",
+    "kind": "SandboxWorkload",
+    "metadata": {
+      "name": "dummy-job",
+      "version": "1.0.0",
+      "description": "Short-lived synthetic Kubernetes Job for throughput testing"
+    },
+    "spec": {
+      "execution": "batch",
+      "container": {
+        "image": "busybox:1.36.1",
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["/bin/sh", "-c"],
+        "args": ["printf 'dummy-job version=1.0.0\\n'"]
+      },
+      "resources": {
+        "requests": {"cpu": "5m", "memory": "4Mi"},
+        "limits": {"cpu": "50m", "memory": "16Mi"}
+      },
+      "ttlSecondsAfterFinished": 60
+    }
+  },
+  {
+    "apiVersion": "orchestration.duvo.ai/v1alpha1",
+    "kind": "SandboxWorkload",
+    "metadata": {
+      "name": "dummy-job",
+      "version": "1.1.0",
+      "description": "Second synthetic Kubernetes Job version for rollout comparison"
+    },
+    "spec": {
+      "execution": "batch",
+      "container": {
+        "image": "busybox:1.36.1",
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["/bin/sh", "-c"],
+        "args": ["printf 'dummy-job version=1.1.0\\n'"]
+      },
+      "resources": {
+        "requests": {"cpu": "5m", "memory": "4Mi"},
+        "limits": {"cpu": "50m", "memory": "16Mi"}
+      },
+      "ttlSecondsAfterFinished": 60
+    }
+  },
+  {
+    "apiVersion": "orchestration.duvo.ai/v1alpha1",
+    "kind": "SandboxWorkload",
+    "metadata": {
+      "name": "dummy-job",
+      "version": "2.0.0",
+      "description": "Canary batch Job that deterministically fails approximately 10% of executions"
+    },
+    "spec": {
+      "execution": "batch",
+      "container": {
+        "image": "python:3.12-slim",
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["python", "-c"],
+        "args": ["import os,sys; n=int(os.environ['DUVO_JOB_ID'].rsplit('-',1)[-1]); print(f'canary sequence={n}'); sys.exit(1 if n%10==0 else 0)"]
+      },
+      "resources": {
+        "requests": {"cpu": "5m", "memory": "16Mi"},
+        "limits": {"cpu": "50m", "memory": "48Mi"}
+      },
+      "ttlSecondsAfterFinished": 60
     }
   }
 ]

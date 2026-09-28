@@ -16,7 +16,13 @@ class WorkloadCatalogTest(unittest.TestCase):
 
         self.assertEqual(
             set(catalog),
-            {("http-echo", "1.0.0"), ("request-inspector", "1.0.0")},
+            {
+                ("http-echo", "1.0.0"),
+                ("request-inspector", "1.0.0"),
+                ("dummy-job", "1.0.0"),
+                ("dummy-job", "1.1.0"),
+                ("dummy-job", "2.0.0"),
+            },
         )
         self.assertEqual(len(resolve_workload(catalog, "http-echo", "1.0.0").digest), 64)
 
@@ -51,6 +57,16 @@ class WorkloadCatalogTest(unittest.TestCase):
             changed = load_catalog(catalog_file.name)[("http-echo", "1.0.0")]
 
         self.assertNotEqual(original.digest, changed.digest)
+
+    def test_batch_workloads_cannot_expose_ports(self):
+        documents = json.loads(CATALOG_PATH.read_text())
+        documents[2]["spec"]["container"]["port"] = 8080
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as catalog_file:
+            json.dump(documents, catalog_file)
+            catalog_file.flush()
+            with self.assertRaisesRegex(CatalogError, "cannot expose a port"):
+                load_catalog(catalog_file.name)
 
 
 if __name__ == "__main__":

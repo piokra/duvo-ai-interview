@@ -15,6 +15,7 @@ NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
 VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ALLOWED_PULL_POLICIES = {"IfNotPresent", "Always", "Never"}
+ALLOWED_EXECUTIONS = {"http", "batch"}
 REQUIRED_RESOURCES = {"cpu", "memory"}
 DEFAULT_CATALOG_PATH = "/manifests/workloads.json"
 
@@ -59,6 +60,10 @@ def _validate_manifest(document: Any, source: str) -> Workload:
     if set(metadata) - {"name", "version", "description"}:
         raise CatalogError(f"{source}: unsupported metadata fields")
 
+    execution = spec.get("execution")
+    if execution not in ALLOWED_EXECUTIONS:
+        raise CatalogError(f"{source}: spec.execution must be http or batch")
+
     container = spec.get("container")
     if not isinstance(container, dict):
         raise CatalogError(f"{source}: spec.container must be an object")
@@ -70,15 +75,22 @@ def _validate_manifest(document: Any, source: str) -> Workload:
         or not re.search(r"(?:@sha256:[0-9a-f]{64}|:[^/:]+)$", image)
     ):
         raise CatalogError(f"{source}: container.image must use an explicit non-latest tag")
-    if not isinstance(port, int) or not 1 <= port <= 65535:
-        raise CatalogError(f"{source}: container.port must be a valid TCP port")
+    if execution == "http" and (not isinstance(port, int) or not 1 <= port <= 65535):
+        raise CatalogError(f"{source}: HTTP container.port must be a valid TCP port")
+    if execution == "batch" and port is not None:
+        raise CatalogError(f"{source}: batch container cannot expose a port")
+    command = container.get("command", [])
+    if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
+        raise CatalogError(f"{source}: container.command must contain strings")
+    if execution == "batch" and not command:
+        raise CatalogError(f"{source}: batch container.command must not be empty")
     args = container.get("args", [])
     if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
         raise CatalogError(f"{source}: container.args must contain strings")
     pull_policy = container.get("imagePullPolicy", "IfNotPresent")
     if pull_policy not in ALLOWED_PULL_POLICIES:
         raise CatalogError(f"{source}: invalid imagePullPolicy")
-    if set(container) - {"image", "imagePullPolicy", "port", "args"}:
+    if set(container) - {"image", "imagePullPolicy", "port", "command", "args"}:
         raise CatalogError(f"{source}: unsupported container fields")
 
     resources = spec.get("resources")
@@ -92,12 +104,23 @@ def _validate_manifest(document: Any, source: str) -> Workload:
             raise CatalogError(f"{source}: resource values must be non-empty strings")
 
     readiness = spec.get("readiness")
-    if not isinstance(readiness, dict) or set(readiness) != {"path"}:
-        raise CatalogError(f"{source}: readiness must contain only path")
-    if not isinstance(readiness["path"], str) or not readiness["path"].startswith("/"):
-        raise CatalogError(f"{source}: readiness.path must start with /")
+    if execution == "http":
+        if not isinstance(readiness, dict) or set(readiness) != {"path"}:
+            raise CatalogError(f"{source}: HTTP readiness must contain only path")
+        if not isinstance(readiness["path"], str) or not readiness["path"].startswith("/"):
+            raise CatalogError(f"{source}: readiness.path must start with /")
+    elif readiness is not None:
+        raise CatalogError(f"{source}: batch workload cannot define readiness")
 
-    allowed_spec_fields = {"container", "resources", "readiness"}
+    ttl = spec.get("ttlSecondsAfterFinished")
+    if execution == "batch" and (not isinstance(ttl, int) or not 30 <= ttl <= 600):
+        raise CatalogError(f"{source}: batch ttlSecondsAfterFinished must be 30..600")
+    if execution == "http" and ttl is not None:
+        raise CatalogError(f"{source}: HTTP workload cannot define ttlSecondsAfterFinished")
+
+    allowed_spec_fields = {
+        "execution", "container", "resources", "readiness", "ttlSecondsAfterFinished"
+    }
     if set(spec) - allowed_spec_fields:
         raise CatalogError(f"{source}: unsupported spec fields: {sorted(set(spec) - allowed_spec_fields)}")
 

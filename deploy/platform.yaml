@@ -26,6 +26,9 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -115,7 +118,9 @@ spec:
             - pip install --no-cache-dir -r /app/requirements.txt && exec uvicorn producer:app --host 0.0.0.0 --port 8000 --app-dir /app
           env:
             - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: JOB_STREAM, value: "sandbox:jobs-rollout"}
             - {name: WORKLOAD_CATALOG_PATH, value: "/manifests/workloads.json"}
+            - {name: STREAM_MAXLEN, value: "100000"}
           ports:
             - {name: http, containerPort: 8000}
           readinessProbe:
@@ -188,9 +193,12 @@ spec:
             - pip install --no-cache-dir -r /app/requirements.txt && exec python /app/consumer.py
           env:
             - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: JOB_STREAM, value: "sandbox:jobs-rollout"}
+            - {name: CONSUMER_GROUP, value: "rollout-consumers"}
             - {name: SANDBOX_NAMESPACE, value: sandboxes}
             - {name: PUBLIC_BASE_URL, value: "__PUBLIC_BASE_URL__"}
             - {name: WORKLOAD_CATALOG_PATH, value: "/manifests/workloads.json"}
+            - {name: MAX_CONCURRENCY, value: "40"}
           ports:
             - {name: metrics, containerPort: 8000}
           resources:
@@ -204,3 +212,76 @@ spec:
           configMap: {name: platform-code}
         - name: workloads
           configMap: {name: workload-manifests}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: load-generator}
+  template:
+    metadata:
+      labels: {app: load-generator}
+    spec:
+      containers:
+        - name: load-generator
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir -r /app/controller-requirements.txt && exec python /app/load_generator.py
+          env:
+            - {name: PRODUCER_URL, value: "http://producer/api/jobs"}
+            - {name: WORKLOAD_NAME, value: dummy-job}
+            - {name: STABLE_VERSION, value: "1.1.0"}
+            - {name: CANARY_VERSION, value: "2.0.0"}
+            - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: RATE_PER_SECOND, value: "10"}
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          volumeMounts:
+            - {name: code, mountPath: /app}
+      volumes:
+        - name: code
+          configMap: {name: platform-code}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rollout-controller
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: rollout-controller}
+  template:
+    metadata:
+      labels: {app: rollout-controller}
+    spec:
+      containers:
+        - name: rollout-controller
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir -r /app/controller-requirements.txt && exec python /app/rollout_controller.py
+          env:
+            - {name: REDIS_URL, value: "redis://redis:6379/0"}
+            - {name: VM_URL, value: "http://victoriametrics.observability.svc.cluster.local:8428"}
+            - {name: WORKLOAD, value: dummy-job}
+            - {name: CANARY_VERSION, value: "2.0.0"}
+            - {name: MIN_SAMPLES, value: "5"}
+            - {name: FAILURE_THRESHOLD, value: "0.05"}
+            - {name: EVALUATION_SECONDS, value: "15"}
+          ports:
+            - {name: metrics, containerPort: 8000}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 96Mi}
+          volumeMounts:
+            - {name: code, mountPath: /app}
+      volumes:
+        - name: code
+          configMap: {name: platform-code}

@@ -32,6 +32,20 @@ curl -X POST "http://NODE_IP/api/jobs" \
 curl "http://NODE_IP/sandboxes/inspect-001"
 ```
 
+The deployed load generator continuously submits about 10 real Kubernetes
+batch Jobs per second. `dummy-job@1.1.0` is stable and `dummy-job@2.0.0` is a
+canary that deterministically fails about 10% of executions. The rollout
+controller changes canary traffic through 10%, 25%, 50%, and 100%, querying
+VictoriaMetrics between steps. It resets traffic to 0% when the canary error
+ratio exceeds 5% after the minimum sample count. Jobs are removed 60 seconds
+after finishing. Change `RATE_PER_SECOND` or scale the generator to adjust or
+stop traffic:
+
+```bash
+kubectl -n platform set env deployment/load-generator RATE_PER_SECOND=5
+kubectl -n platform scale deployment/load-generator --replicas=0
+```
+
 ## Versioned workload manifests
 
 [`manifests/workloads.json`](manifests/workloads.json) is the allow-listed
@@ -48,6 +62,12 @@ This makes producer/consumer catalog skew fail closed and leaves
 `workload-version` labels on Kubernetes objects and metrics for future rollout
 targeting. Arbitrary images, commands, environment variables, volumes, and
 security contexts cannot be submitted through the public API.
+
+Manifests support `http` execution (Pod, Service, and Ingress) and `batch`
+execution (a real Kubernetes Job). Batch Jobs are created concurrently, use a
+bounded completion timeout, and require a TTL so sustained test traffic does
+not leave unbounded Kubernetes objects. The Redis stream is approximately
+trimmed to its latest 100,000 entries for the same reason.
 
 Sandbox Pods also disable service-account token mounting, drop Linux
 capabilities, use the runtime-default seccomp profile, forbid privilege
